@@ -1,7 +1,10 @@
 package main
 
 import (
-	"context"
+	"bytes"
+	"encoding/csv"
+	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"os"
@@ -11,17 +14,18 @@ import (
 	"github.com/gin-contrib/cors"
 	"github.com/gin-gonic/gin"
 	influxdb2 "github.com/influxdata/influxdb-client-go/v2"
+	"github.com/influxdata/influxdb-client-go/v2/api/write"
 )
 
 type IMUData struct {
-	Participant  string    `json:"participant"`
-	Exercise     string    `json:"exercise"`
-	Timestamp    time.Time `json:"timestamp"`
-	RepID        int       `json:"rep_id"`
-	IsRepActive  bool      `json:"is_rep_active"`
+	Participant   string    `json:"participant"`
+	Exercise      string    `json:"exercise"`
+	Timestamp     time.Time `json:"timestamp"`
+	RepID         int       `json:"rep_id"`
+	IsRepActive   bool      `json:"is_rep_active"`
 	Accelerometer []float64 `json:"accelerometer"`
-	Gyroscope    []float64 `json:"gyroscope"`
-	Magnetometer []float64 `json:"magnetometer"`
+	Gyroscope     []float64 `json:"gyroscope"`
+	Magnetometer  []float64 `json:"magnetometer"`
 }
 
 var (
@@ -31,7 +35,6 @@ var (
 )
 
 func main() {
-	// Initialize InfluxDB client
 	influxClient = influxdb2.NewClient(
 		os.Getenv("INFLUXDB_URL"),
 		os.Getenv("INFLUXDB_TOKEN"),
@@ -41,14 +44,11 @@ func main() {
 	org = os.Getenv("INFLUXDB_ORG")
 	bucket = os.Getenv("INFLUXDB_BUCKET")
 
-	// Create Gin router
 	router := gin.Default()
 	router.Use(cors.Default())
 
-	// API endpoint
-	router.POST("/imu", handleIMUData)
+	router.POST("/imu/csv", handleCSVData)
 
-	// Start server
 	port := os.Getenv("PORT")
 	if port == "" {
 		port = "8080"
@@ -57,22 +57,12 @@ func main() {
 	log.Fatal(router.Run(":" + port))
 }
 
-func handleIMUData(c *gin.Context) {
-	var data IMUData
-	if err := c.ShouldBindJSON(&data); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
-		return
-	}
-
-	// Validate sensor data
+func createInfluxPoint(data IMUData) (*write.Point, error) {
 	if len(data.Accelerometer) != 3 || len(data.Gyroscope) != 3 || len(data.Magnetometer) != 3 {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid sensor data format"})
-		return
+		return nil, fmt.Errorf("invalid sensor data format")
 	}
 
-	// Write to InfluxDB
-	writeAPI := influxClient.WriteAPIBlocking(org, bucket)
-	p := influxdb2.NewPointWithMeasurement("exercise_data").
+	return influxdb2.NewPointWithMeasurement("exercise_data").
 		AddTag("participant", data.Participant).
 		AddTag("exercise", data.Exercise).
 		AddTag("rep_id", strconv.Itoa(data.RepID)).
@@ -86,12 +76,111 @@ func handleIMUData(c *gin.Context) {
 		AddField("magnetometer_x", data.Magnetometer[0]).
 		AddField("magnetometer_y", data.Magnetometer[1]).
 		AddField("magnetometer_z", data.Magnetometer[2]).
-		SetTime(data.Timestamp)
+		SetTime(data.Timestamp), nil
+}
 
-	if err := writeAPI.WritePoint(context.Background(), p); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to write to database"})
+func handleCSVData(c *gin.Context) {
+	body, err := io.ReadAll(c.Request.Body)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Failed to read request body"})
 		return
 	}
 
-	c.JSON(http.StatusOK, gin.H{"message": "Data stored successfully"})
+	r := csv.NewReader(bytes.NewReader(body))
+	records, err := r.ReadAll()
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid CSV format"})
+		return
+	}
+
+	if len(records) < 2 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "No data records provided"})
+		return
+	}
+
+	writeAPI := influxClient.WriteAPI(org, bucket)
+	errorCount := 0
+
+	for i, record := range records[1:] {
+		if len(record) < 14 {
+			log.Printf("Line %d: insufficient columns", i+2)
+			errorCount++
+			continue
+		}
+
+		timestamp, err := time.Parse(time.RFC3339, record[2])
+		if err != nil {
+			log.Printf("Line %d: invalid timestamp: %v", i+2, err)
+			errorCount++
+			continue
+		}
+
+		repID, err := strconv.Atoi(record[3])
+		if err != nil {
+			log.Printf("Line %d: invalid rep_id: %v", i+2, err)
+			errorCount++
+			continue
+		}
+
+		isRepActive, err := strconv.ParseBool(record[4])
+		if err != nil {
+			log.Printf("Line %d: invalid is_rep_active: %v", i+2, err)
+			errorCount++
+			continue
+		}
+
+		sensorValues := make([]float64, 9)
+		for j := 5; j < 14; j++ {
+			val, err := strconv.ParseFloat(record[j], 64)
+			if err != nil {
+				log.Printf("Line %d: invalid sensor value at column %d: %v", i+2, j+1, err)
+				errorCount++
+				continue
+			}
+			sensorValues[j-5] = val
+		}
+
+		data := IMUData{
+			Participant:   record[0],
+			Exercise:      record[1],
+			Timestamp:     timestamp,
+			RepID:         repID,
+			IsRepActive:   isRepActive,
+			Gyroscope:     sensorValues[0:3],
+			Accelerometer: sensorValues[3:6],
+			Magnetometer:  sensorValues[6:9],
+		}
+
+		point, err := createInfluxPoint(data)
+		if err != nil {
+			log.Printf("Line %d: %v", i+2, err)
+			errorCount++
+			continue
+		}
+
+		writeAPI.WritePoint(point)
+	}
+
+	go func() {
+		errorsCh := writeAPI.Errors()
+		for err := range errorsCh {
+			log.Printf("Write error: %s", err.Error())
+			errorCount++
+		}
+	}()
+
+	totalRecords := len(records) - 1
+	if errorCount > 0 {
+		c.JSON(http.StatusMultiStatus, gin.H{
+			"message":    "CSV partially processed",
+			"total":      totalRecords,
+			"errors":     errorCount,
+			"successful": totalRecords - errorCount,
+		})
+	} else {
+		c.JSON(http.StatusOK, gin.H{
+			"message": "CSV successfully processed",
+			"total":   totalRecords,
+		})
+	}
 }
